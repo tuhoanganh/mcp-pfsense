@@ -1,7 +1,7 @@
 """User and group management tools for pfSense MCP server."""
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from mcp.types import ToolAnnotations
 
@@ -16,6 +16,7 @@ from ..helpers import (
 )
 from ..models import QueryFilter
 from ..server import get_api_client, logger, mcp
+from .certificates import delete_certificate, generate_certificate
 
 # LDAP transport -> upstream AuthServer.ldap_urltype vocabulary. The pre-fix
 # code sent a `transport` field with tcp/ssl/starttls, none of which the API
@@ -86,6 +87,8 @@ async def create_user(
     expires: Optional[str] = None,
     authorizedkeys: Optional[str] = None,
     ipsecpsk: Optional[str] = None,
+    uid: Optional[int] = None,
+    cert: Optional[List[str]] = None,
 ) -> Dict:
     """Create a new pfSense local user
 
@@ -98,6 +101,8 @@ async def create_user(
         expires: Account expiration date (MM/DD/YYYY format)
         authorizedkeys: SSH authorized public keys (base64 encoded)
         ipsecpsk: IPsec Pre-Shared Key for this user
+        uid: Explicit unix UID to assign — use when pfSense nextuid counter is stale/colliding
+        cert: List of certificate refids to associate with the user
     """
     client = get_api_client()
     try:
@@ -127,6 +132,12 @@ async def create_user(
         if ipsecpsk:
             user_data["ipsecpsk"] = ipsecpsk
 
+        if uid is not None:
+            user_data["uid"] = uid
+
+        if cert is not None:
+            user_data["cert"] = cert
+
         result = await client.create_user(user_data)
 
         return {
@@ -153,6 +164,7 @@ async def update_user(
     expires: Optional[str] = None,
     authorizedkeys: Optional[str] = None,
     ipsecpsk: Optional[str] = None,
+    cert: Optional[List[str]] = None,
 ) -> Dict:
     """Update an existing pfSense local user by ID
 
@@ -166,6 +178,7 @@ async def update_user(
         expires: Account expiration date (MM/DD/YYYY format)
         authorizedkeys: SSH authorized public keys (base64 encoded)
         ipsecpsk: IPsec Pre-Shared Key
+        cert: List of certificate refids to associate with the user (replaces existing linkage on the user record)
     """
     client = get_api_client()
     try:
@@ -178,6 +191,7 @@ async def update_user(
             "expires": "expires",
             "authorizedkeys": "authorizedkeys",
             "ipsecpsk": "ipsecpsk",
+            "cert": "cert",
         }
 
         params = {
@@ -189,6 +203,7 @@ async def update_user(
             "expires": expires,
             "authorizedkeys": authorizedkeys,
             "ipsecpsk": ipsecpsk,
+            "cert": cert,
         }
 
         updates: Dict = {}
@@ -251,6 +266,128 @@ async def delete_user(
     except Exception as e:
         logger.error(f"Failed to delete user: {e}")
         return {"success": False, "error": str(e)}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+@rate_limited
+async def create_user_with_certificate(
+    name: str,
+    password: str,
+    caref: str,
+    cert_descr: str,
+    dn_commonname: Optional[str] = None,
+    keytype: str = "RSA",
+    keylen: int = 2048,
+    digest_alg: str = "sha256",
+    lifetime: int = 3650,
+    priv: Optional[List[str]] = None,
+    descr: Optional[str] = None,
+    disabled: bool = False,
+    expires: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a pfSense user and a signed certificate, then link them atomically.
+
+    Generates a user certificate signed by the given CA, creates the local user
+    with the certificate linked, and rolls back the certificate if user creation
+    fails.
+
+    Args:
+        name: Username (login name)
+        password: User password
+        caref: Reference ID of the Certificate Authority to sign the user cert
+        cert_descr: Descriptive name for the generated certificate
+        dn_commonname: Common Name for the certificate (defaults to name if omitted)
+        keytype: Key type — "RSA" or "ECDSA" (default: "RSA")
+        keylen: Key length in bits — 2048 or 4096 for RSA; 256 or 384 for ECDSA (default: 2048)
+        digest_alg: Digest algorithm — sha256, sha384, sha512 (default: sha256)
+        lifetime: Certificate lifetime in days (default: 3650 = ~10 years)
+        priv: List of privileges to assign to the user
+        descr: User description / full name
+        disabled: Whether the user account starts disabled (default: False)
+        expires: Account expiration date (MM/DD/YYYY format)
+    """
+    if dn_commonname is None:
+        dn_commonname = name
+
+    # Step 1: Generate the certificate
+    cert_result = await generate_certificate(
+        descr=cert_descr,
+        caref=caref,
+        dn_commonname=dn_commonname,
+        keytype=keytype,
+        keylen=keylen,
+        digest_alg=digest_alg,
+        lifetime=lifetime,
+        type="user",
+    )
+
+    if not cert_result.get("success"):
+        return {
+            "success": False,
+            "error": f"Certificate generation failed: {cert_result.get('error', 'unknown error')}",
+        }
+
+    cert_data = cert_result.get("certificate") or {}
+    refid = cert_data.get("refid")
+    cert_int_id = cert_data.get("id")
+
+    if not refid:
+        return {
+            "success": False,
+            "error": "Certificate was generated but the API returned no refid — cannot link to user",
+            "certificate": cert_data,
+        }
+
+    # Step 2: Create the user with the certificate linked
+    user_result = await create_user(
+        name=name,
+        password=password,
+        cert=[refid],
+        priv=priv,
+        descr=descr,
+        disabled=disabled,
+        expires=expires,
+    )
+
+    if not user_result.get("success"):
+        user_error = user_result.get("error", "unknown error")
+
+        # Rollback: attempt to delete the orphaned certificate
+        rollback_error: Optional[str] = None
+        if cert_int_id is not None:
+            try:
+                rb_result = await delete_certificate(certificate_id=cert_int_id, confirm=True)
+                if not rb_result.get("success"):
+                    rollback_error = rb_result.get("error", "delete_certificate returned success=False")
+            except Exception as rb_exc:
+                rollback_error = str(rb_exc)
+        else:
+            rollback_error = "cert integer ID not available in API response — manual cleanup required"
+
+        if rollback_error:
+            return {
+                "success": False,
+                "error": (
+                    f"User creation failed ({user_error}); "
+                    f"cert rollback ALSO FAILED ({rollback_error}) — "
+                    f"certificate refid={refid} id={cert_int_id} is ORPHANED and must be deleted manually"
+                ),
+                "orphaned_cert_refid": refid,
+                "orphaned_cert_id": cert_int_id,
+            }
+
+        return {
+            "success": False,
+            "error": f"User creation failed; rolled back cert refid={refid}: {user_error}",
+        }
+
+    return {
+        "success": True,
+        "user": user_result.get("user"),
+        "certificate": cert_data,
+        "linked_cert_refid": refid,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ------------------------------------------------------------------ #
