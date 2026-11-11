@@ -11,7 +11,10 @@ pfsense-openapi-v2.json
 ollama-todo.md
 
 # Editor/tool settings
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/**/*.zip
+.claude/settings.local.json
 
 # Python
 __pycache__/
